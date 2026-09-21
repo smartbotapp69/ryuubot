@@ -1,0 +1,81 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w \
+              -X ryubot/internal/buildinfo.Version=${{ github.ref_name }} \
+              -X ryubot/internal/buildinfo.Commit=${{ github.sha }} \
+              -X ryubot/internal/buildinfo.BuiltAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o bin/ryubot ./cmd/ryubot
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p 2988 -H 202.155.18.235 >> ~/.ssh/known_hosts
+
+      - name: Upload
+        run: |
+          scp -i ~/.ssh/deploy_key -P 2988 bin/ryubot root@202.155.18.235:/opt/ryubot/ryubot.new
+          scp -i ~/.ssh/deploy_key -P 2988 .env root@202.155.18.235:/opt/ryubot/.env
+
+      - name: Install service & restart
+        run: |
+          ssh -i ~/.ssh/deploy_key -p 2988 root@202.155.18.235 bash << 'ENDSSH'
+            set -e
+
+            mv /opt/ryubot/ryubot.new /opt/ryubot/ryubot
+            chmod +x /opt/ryubot/ryubot
+
+            if [ ! -f /etc/systemd/system/ryubot.service ]; then
+              cat > /etc/systemd/system/ryubot.service << 'EOF'
+[Unit]
+Description=Ryubot API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ryubot
+ExecStart=/opt/ryubot/ryubot serve
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+              systemctl daemon-reload
+              systemctl enable ryubot
+            fi
+
+            /opt/ryubot/ryubot migrate
+            systemctl restart ryubot
+            sleep 2
+            systemctl status ryubot --no-pager
+          ENDSSH

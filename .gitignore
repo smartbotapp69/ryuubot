@@ -1,0 +1,12 @@
+.env.*
+!.env
+!.env.example
+bin/
+coverage.out
+*.log
+*.exe
+runtime/
+backups/
+*.dump
+*.sql
+*.sql.gz
