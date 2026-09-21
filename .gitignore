@@ -8,5 +8,6 @@ coverage.out
 runtime/
 backups/
 *.dump
-*.sql
 *.sql.gz
+# allow database exports
+!database/*.sql
