@@ -19,10 +19,11 @@ import (
 var coins = []string{"TRX", "DOGE", "FLOKI", "BTT"}
 
 type Service struct {
-	pool     *pgxpool.Pool
-	provider *pasino.Client
-	logger   *slog.Logger
+	pool          *pgxpool.Pool
+	provider      *pasino.Client
+	logger        *slog.Logger
 	lastCutoffCheck string
+	lastCutoffError time.Time
 }
 
 func New(pool *pgxpool.Pool, provider *pasino.Client, logger *slog.Logger) *Service {
@@ -33,7 +34,7 @@ func (s *Service) Run(ctx context.Context) {
 	_, _ = s.pool.Exec(ctx, `UPDATE management_fee_payouts SET status='REVIEW_REQUIRED',failure_reason='Proses berhenti setelah transfer dikirim; verifikasi sebelum retry',updated_at=now() WHERE status='SENT'`)
 	_, _ = s.pool.Exec(ctx, `UPDATE owner_cutoff_payouts SET status='REVIEW_REQUIRED',failure_reason='Proses berhenti setelah transfer dikirim; verifikasi sebelum retry',updated_at=now() WHERE status='SENT'`)
 	s.run(ctx)
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -52,15 +53,30 @@ func (s *Service) run(ctx context.Context) {
 	}
 	cancelFees()
 	location, _ := time.LoadLocation("Asia/Jakarta")
-	minute := time.Now().In(location).Format("2006-01-02 15:04")
-	if minute == s.lastCutoffCheck {
+	now := time.Now().In(location)
+	currentTime := now.Format("15:04")
+	cfg, err := s.settings(ctx, "owner.cutoff_1", "owner.cutoff_2")
+	if err != nil {
 		return
 	}
-	s.lastCutoffCheck = minute
-	cutoffCtx, cancelCutoff := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancelCutoff()
-	if err := s.runCutoff(cutoffCtx); err != nil && !errors.Is(err, context.Canceled) {
-		s.logger.Error("owner cutoff failed", "error", err)
+	for _, slot := range []string{cfg["owner.cutoff_1"], cfg["owner.cutoff_2"]} {
+		if currentTime != slot {
+			continue
+		}
+		daySlot := now.Format("2006-01-02") + " " + slot
+		if daySlot == s.lastCutoffCheck {
+			continue
+		}
+		s.lastCutoffCheck = daySlot
+		if time.Since(s.lastCutoffError) < 5*time.Minute {
+			continue
+		}
+		cutoffCtx, cancelCutoff := context.WithTimeout(ctx, 5*time.Minute)
+		if err := s.runCutoffAt(cutoffCtx, slot); err != nil && !errors.Is(err, context.Canceled) {
+			s.lastCutoffError = time.Now()
+			s.logger.Error("owner cutoff failed", "error", err)
+		}
+		cancelCutoff()
 	}
 }
 
@@ -183,7 +199,7 @@ func (s *Service) sendFee(ctx context.Context, job feeJob) error {
 	return tx.Commit(ctx)
 }
 
-func (s *Service) runCutoff(ctx context.Context) error {
+func (s *Service) runCutoffAt(ctx context.Context, slot string) error {
 	keys := []string{"owner.cutoff_1", "owner.cutoff_2", "owner.nana_percent", "owner.deni_percent", "owner.arya_percent", "owner.operational_percent", "account.fee_collector_username", "account.owner_nana_username", "account.owner_deni_username", "account.owner_arya_username", "account.operational_username"}
 	cfg, err := s.settings(ctx, keys...)
 	if err != nil {
@@ -196,25 +212,27 @@ func (s *Service) runCutoff(ctx context.Context) error {
 		return err
 	}
 	var failures []error
-	for _, slot := range []string{cfg["owner.cutoff_1"], cfg["owner.cutoff_2"]} {
-		if now.Format("15:04") < slot {
-			continue
-		}
-		for _, coin := range coins {
-			coinCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-			err = s.cutoffCoin(coinCtx, collectorID, now.Format("2006-01-02"), slot, coin, cfg)
-			cancel()
-			if err != nil {
-				failures = append(failures, fmt.Errorf("%s %s: %w", slot, coin, err))
-			}
+	for _, coin := range coins {
+		coinCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		err = s.cutoffCoin(coinCtx, collectorID, now.Format("2006-01-02"), slot, coin, cfg)
+		cancel()
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s %s: %w", slot, coin, err))
 		}
 	}
 	return errors.Join(failures...)
 }
 
 func (s *Service) cutoffCoin(ctx context.Context, collectorID int64, date, slot, coin string, cfg map[string]string) error {
+	slotTime, err := time.ParseInLocation("15:04", slot, time.Local)
+	if err != nil {
+		return fmt.Errorf("format slot tidak valid: %w", err)
+	}
+	// pgx maps time.Time with zero date to PostgreSQL time type.
+	// We construct a time.Time with date=0 to force this mapping.
+	slotAtTime := time.Date(0, time.January, 1, slotTime.Hour(), slotTime.Minute(), 0, 0, time.Local)
 	var batchID, batchStatus string
-	err := s.pool.QueryRow(ctx, `SELECT id::text,status FROM owner_cutoff_batches WHERE business_date=$1 AND cutoff_slot=$2::time AND coin=$3`, date, slot, coin).Scan(&batchID, &batchStatus)
+	err = s.pool.QueryRow(ctx, `SELECT id::text,status FROM owner_cutoff_batches WHERE business_date=$1 AND cutoff_slot=$2 AND coin=$3`, date, slotAtTime, coin).Scan(&batchID, &batchStatus)
 	if err == nil {
 		if batchStatus == "COMPLETED" || batchStatus == "REVIEW_REQUIRED" {
 			return nil

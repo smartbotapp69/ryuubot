@@ -21,7 +21,7 @@ func (e *Engine) RunWorker(ctx context.Context) error {
 	if err := e.Recover(ctx); err != nil {
 		return err
 	}
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	recoverTicker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	defer recoverTicker.Stop()
@@ -37,7 +37,7 @@ func (e *Engine) RunWorker(ctx context.Context) error {
 				e.logger.Error("recover trading sessions failed", "error", err)
 			}
 		case <-ticker.C:
-			for i := 0; i < 50; i++ {
+			for i := 0; i < 20; i++ {
 				command, ok, err := e.commands.Claim(ctx, e.workerID)
 				if err != nil {
 					e.logger.Error("claim trading command failed", "error", err)

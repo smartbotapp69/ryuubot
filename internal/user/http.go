@@ -61,6 +61,7 @@ func (h *HTTP) Register(mux *http.ServeMux) {
 	mux.Handle("GET /api/user/wallet/qr", h.require(http.HandlerFunc(h.walletQR)))
 	mux.Handle("GET /api/user/referral", h.require(http.HandlerFunc(h.referral)))
 	mux.Handle("GET /api/user/referral/bonus", h.require(http.HandlerFunc(h.referralBonus)))
+	mux.Handle("POST /api/user/referral/bonus/claim", h.require(http.HandlerFunc(h.claimReferralBonus)))
 	mux.Handle("PUT /api/user/profile/password", h.require(http.HandlerFunc(h.changePassword)))
 	mux.Handle("POST /api/user/wallet/withdraw", h.require(http.HandlerFunc(h.withdraw)))
 	mux.Handle("POST /api/user/wallet/transfer", h.require(http.HandlerFunc(h.transfer)))
@@ -634,6 +635,60 @@ func (h *HTTP) referralBonus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"coin": coin, "available": available, "claimed": claimed, "minimum_claim": minimum, "levels": levels, "history": history})
+}
+func (h *HTTP) claimReferralBonus(w http.ResponseWriter, r *http.Request) {
+	account := current(r)
+	if !h.validCSRF(r, account) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid_csrf"})
+		return
+	}
+	var body struct {
+		Coin string `json:"coin"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	coin := strings.ToUpper(strings.TrimSpace(body.Coin))
+	if coin != "TRX" && coin != "DOGE" && coin != "FLOKI" && coin != "BTT" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_coin"})
+		return
+	}
+	available, _, minimum, _, err := h.store.ReferralBonus(r.Context(), account.ID, coin)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	avail, _ := trading.ParseMoney(available)
+	minClaim, _ := trading.ParseMoney(minimum)
+	if avail < minClaim {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "below_minimum_claim", "message": "Bonus belum mencapai minimum klaim"})
+		return
+	}
+	claimedAmount, err := h.store.ClaimBonus(r.Context(), account.ID, coin)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	collectorUsername, err := h.store.GetCollectorUsername(r.Context())
+	if err != nil {
+		h.logger.Error("get collector username failed", "error", err)
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "claimed": claimedAmount})
+		return
+	}
+	collectorID, err := h.store.GetUserID(r.Context(), collectorUsername)
+	if err != nil {
+		h.logger.Error("get collector user id failed", "error", err)
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "claimed": claimedAmount})
+		return
+	}
+	response, transferErr := h.provider.Transfer(r.Context(), collectorID, coin, account.Username, claimedAmount)
+	if transferErr != nil {
+		h.logger.Error("transfer bonus failed", "error", transferErr)
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "claimed": claimedAmount, "warning": "transfer gagal, perlu verifikasi manual"})
+		return
+	}
+	_ = response
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "claimed": claimedAmount})
 }
 func (h *HTTP) saveTradingSettings(w http.ResponseWriter, r *http.Request) {
 	account := current(r)

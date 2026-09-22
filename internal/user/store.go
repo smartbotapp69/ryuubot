@@ -339,6 +339,47 @@ func (s *Store) ReferralBonus(ctx context.Context, userID int64, coin string) (a
 	return
 }
 
+func (s *Store) ClaimBonus(ctx context.Context, userID int64, coin string) (claimed string, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+	var available, currentClaimed string
+	err = tx.QueryRow(ctx, `SELECT coalesce(available_amount,0)::text,coalesce(claimed_amount,0)::text FROM referral_bonus_balances WHERE user_id=$1 AND coin=$2 FOR UPDATE`, userID, coin).Scan(&available, &currentClaimed)
+	if err != nil {
+		return "", err
+	}
+	if available == "0" || available == "0.00000000" {
+		return currentClaimed, nil
+	}
+	_, err = tx.Exec(ctx, `UPDATE referral_bonus_balances SET claimed_amount=coalesce(claimed_amount,0)::numeric+$1::numeric,available_amount=0 WHERE user_id=$2 AND coin=$3`, available, userID, coin)
+	if err != nil {
+		return "", err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO referral_bonus_events(user_id,amount,event_type,coin,source_external_id,occurred_at) VALUES($1,$2,'CLAIM_COMPLETED',$3,'wallet:claim',now())`, userID, available, coin)
+	if err != nil {
+		return "", err
+	}
+	err = tx.Commit(ctx)
+	if err != nil {
+		return "", err
+	}
+	return available, nil
+}
+
+func (s *Store) GetCollectorUsername(ctx context.Context) (string, error) {
+	var username string
+	err := s.pool.QueryRow(ctx, `SELECT value FROM app_settings WHERE key='account.fee_collector_username'`).Scan(&username)
+	return username, err
+}
+
+func (s *Store) GetUserID(ctx context.Context, username string) (int64, error) {
+	var id int64
+	err := s.pool.QueryRow(ctx, `SELECT id FROM users WHERE lower(username)=lower($1) AND status='ACTIVE'`, username).Scan(&id)
+	return id, err
+}
+
 func (s *Store) TradingSettings(ctx context.Context, userID int64) (TradingSettings, error) {
 	settings := DefaultTradingSettings()
 	err := s.pool.QueryRow(ctx, `SELECT coin,base_bet::text,chance_min::integer::text,chance_max::integer::text,delay_ms,

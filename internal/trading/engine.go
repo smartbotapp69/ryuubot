@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -327,6 +328,7 @@ func (e *Engine) run(userID int64, sessionID string) {
 	e.running[userID] = cancel
 	e.mu.Unlock()
 	defer func() { cancel(); e.mu.Lock(); delete(e.running, userID); e.mu.Unlock() }()
+	time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
 	for {
 		stop, delay, err := e.roll(ctx, userID, sessionID)
 		if err != nil {
@@ -535,6 +537,9 @@ func (e *Engine) roll(ctx context.Context, userID int64, sessionID string) (bool
 	delay := time.Duration(settings.DelayMS)*time.Millisecond - time.Since(rollStartedAt)
 	if delay < 0 {
 		delay = 0
+	}
+	if delay < 1*time.Second {
+		delay = 1 * time.Second
 	}
 	return false, delay, nil
 }
