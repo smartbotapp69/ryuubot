@@ -15,7 +15,15 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-const sessionLifetime = 30 * 24 * time.Hour
+// Sessions live effectively forever while they are used: new sessions start
+// with a 10-year horizon and Authenticate slides the expiry forward. The only
+// way a session ends is an explicit logout (owner rule: no time-based logout).
+const sessionLifetime = 10 * 365 * 24 * time.Hour
+
+// ErrUnauthenticated marks a definitively missing/expired session, as opposed
+// to infrastructure failures while checking one (which must not log the user
+// out and are returned wrapped instead).
+var ErrUnauthenticated = errors.New("unauthenticated")
 
 type Store struct{ pool *pgxpool.Pool }
 
@@ -24,6 +32,7 @@ type Account struct {
 	Username              string     `json:"username"`
 	Email                 string     `json:"email"`
 	CSRF                  string     `json:"csrf_token,omitempty"`
+	Status                string     `json:"status"`
 	SubscriptionExpiresAt *time.Time `json:"subscription_expires_at,omitempty"`
 }
 type Registration struct{ Username, Email, Password, Referrer, AccessTokenCiphertext, PasswordCiphertext string }
@@ -128,8 +137,10 @@ func (s *Store) CleanupTransientHistory(ctx context.Context) error {
 func (s *Store) Login(ctx context.Context, username, password string) (string, Account, error) {
 	var account Account
 	var hash string
-	err := s.pool.QueryRow(ctx, `SELECT id,username,email,password_hash,subscription_expires_at FROM users
-		WHERE lower(username)=lower($1) AND status='ACTIVE' LIMIT 1`, username).Scan(&account.ID, &account.Username, &account.Email, &hash, &account.SubscriptionExpiresAt)
+	// A suspended account may still log in so the app can show the suspended
+	// gate screen instead of silently failing; DELETED stays rejected.
+	err := s.pool.QueryRow(ctx, `SELECT id,username,email,password_hash,status,subscription_expires_at FROM users
+		WHERE lower(username)=lower($1) AND status IN ('ACTIVE','SUSPENDED') LIMIT 1`, username).Scan(&account.ID, &account.Username, &account.Email, &hash, &account.Status, &account.SubscriptionExpiresAt)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
 		return "", Account{}, errors.New("username atau password tidak valid")
 	}
@@ -147,12 +158,9 @@ func (s *Store) Login(ctx context.Context, username, password string) (string, A
 		return "", Account{}, err
 	}
 	defer tx.Rollback(ctx)
-	// The Node application permits only one active user session. Keep that rule
-	// while avoiding a separate active_session column.
-	if _, err = tx.Exec(ctx, `DELETE FROM user_sessions WHERE user_id=$1`, account.ID); err != nil {
-		return "", Account{}, err
-	}
-	if _, err = tx.Exec(ctx, `INSERT INTO user_sessions(token_hash,user_id,csrf_token,expires_at) VALUES($1,$2,$3,now()+interval '30 days')`, digest[:], account.ID, csrf); err != nil {
+	// Multiple concurrent sessions are allowed: logging in from another device
+	// must not log a running bot out. Only an explicit logout ends a session.
+	if _, err = tx.Exec(ctx, `INSERT INTO user_sessions(token_hash,user_id,csrf_token,expires_at) VALUES($1,$2,$3,now()+interval '10 years')`, digest[:], account.ID, csrf); err != nil {
 		return "", Account{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -221,7 +229,7 @@ func (s *Store) Register(ctx context.Context, input Registration) (string, Accou
 	}
 	var account Account
 	err = tx.QueryRow(ctx, `INSERT INTO users(username,email,password_hash,status,subscription_expires_at,subscription_trial_ends_at)
-		VALUES($1,$2,$3,'ACTIVE',now()+($4::int*interval '1 day'),now()+($4::int*interval '1 day')) RETURNING id,username,email,subscription_expires_at`, input.Username, strings.ToLower(input.Email), string(hash), trialDays).Scan(&account.ID, &account.Username, &account.Email, &account.SubscriptionExpiresAt)
+		VALUES($1,$2,$3,'ACTIVE',now()+($4::int*interval '1 day'),now()+($4::int*interval '1 day')) RETURNING id,username,email,status,subscription_expires_at`, input.Username, strings.ToLower(input.Email), string(hash), trialDays).Scan(&account.ID, &account.Username, &account.Email, &account.Status, &account.SubscriptionExpiresAt)
 	if err != nil {
 		return "", Account{}, err
 	}
@@ -234,7 +242,7 @@ func (s *Store) Register(ctx context.Context, input Registration) (string, Accou
 	if _, err = tx.Exec(ctx, `INSERT INTO user_pasino_accounts(user_id,provider_username,provider_email,password_ciphertext,access_token_ciphertext,encryption_version,last_authenticated_at) VALUES($1,$2,$3,$4,$5,1,now())`, account.ID, account.Username, account.Email, input.PasswordCiphertext, input.AccessTokenCiphertext); err != nil {
 		return "", Account{}, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO user_sessions(token_hash,user_id,csrf_token,expires_at) VALUES($1,$2,$3,now()+interval '30 days')`, digest[:], account.ID, csrf); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO user_sessions(token_hash,user_id,csrf_token,expires_at) VALUES($1,$2,$3,now()+interval '10 years')`, digest[:], account.ID, csrf); err != nil {
 		return "", Account{}, err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE users SET last_login_at=now(),last_active_at=now(),updated_at=now() WHERE id=$1`, account.ID); err != nil {
@@ -249,19 +257,29 @@ func (s *Store) Register(ctx context.Context, input Registration) (string, Accou
 
 func (s *Store) Authenticate(ctx context.Context, token string) (Account, error) {
 	if token == "" {
-		return Account{}, errors.New("unauthenticated")
+		return Account{}, ErrUnauthenticated
 	}
 	digest := sha256.Sum256([]byte(token))
 	var account Account
-	err := s.pool.QueryRow(ctx, `SELECT u.id,u.username,u.email,s.csrf_token,u.subscription_expires_at FROM user_sessions s
+	err := s.pool.QueryRow(ctx, `SELECT u.id,u.username,u.email,s.csrf_token,u.status,u.subscription_expires_at FROM user_sessions s
 		JOIN users u ON u.id=s.user_id
-		WHERE s.token_hash=$1 AND s.expires_at>now() AND u.status='ACTIVE'`, digest[:]).Scan(&account.ID, &account.Username, &account.Email, &account.CSRF, &account.SubscriptionExpiresAt)
+		WHERE s.token_hash=$1 AND s.expires_at>now() AND u.status IN ('ACTIVE','SUSPENDED')`, digest[:]).Scan(&account.ID, &account.Username, &account.Email, &account.CSRF, &account.Status, &account.SubscriptionExpiresAt)
 	if err == nil {
 		// A five-minute write throttle records real application use without
 		// turning every authenticated API call into a database write.
 		_, _ = s.pool.Exec(ctx, `UPDATE users SET last_active_at=now() WHERE id=$1 AND (last_active_at IS NULL OR last_active_at < now()-interval '5 minutes')`, account.ID)
+		// Slide the session horizon forward so an active session never expires
+		// by time. Runs at most ~once a year per session (10y -> <9y remaining);
+		// also rescues pre-existing 30-day sessions on their first request.
+		_, _ = s.pool.Exec(ctx, `UPDATE user_sessions SET expires_at=now()+interval '10 years' WHERE token_hash=$1 AND expires_at < now()+interval '9 years'`, digest[:])
+		return account, nil
 	}
-	return account, err
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Account{}, ErrUnauthenticated
+	}
+	// Infrastructure failure: surface it wrapped so callers keep the cookie
+	// intact and retry instead of treating a blip as a logout.
+	return Account{}, fmt.Errorf("session lookup failed: %w", err)
 }
 
 func (s *Store) Logout(ctx context.Context, token string) {

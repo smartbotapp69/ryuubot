@@ -24,8 +24,10 @@ type Config struct {
 	LegacyDatabaseURL   string
 	PasinoAPIBaseURL    string
 	PasinoSocketURL     string
+	PasinoProxyURL      string
 	PasinoAPIKey        string
 	PasinoCredentialKey string
+	PasinoReferrer      string
 	AdminUsername       string
 	AdminPassword       string
 }
@@ -46,8 +48,10 @@ func Load() (Config, error) {
 		LegacyDatabaseURL:   strings.TrimSpace(os.Getenv("RYUBOT_LEGACY_DATABASE_URL")),
 		PasinoAPIBaseURL:    value("PASINO_API_BASE_URL", "https://api.pasino.io"),
 		PasinoSocketURL:     value("PASINO_SOCKET_URL", "wss://socket.pasino.io/dice/"),
+		PasinoProxyURL:      strings.TrimSpace(os.Getenv("PASINO_PROXY_URL")),
 		PasinoAPIKey:        strings.TrimSpace(os.Getenv("PASINO_API_KEY")),
 		PasinoCredentialKey: strings.TrimSpace(os.Getenv("PASINO_CREDENTIAL_ENCRYPTION_KEY")),
+		PasinoReferrer:      strings.TrimSpace(value("PASINO_REFERRER", "277064")),
 		AdminUsername:       strings.TrimSpace(os.Getenv("RYUBOT_ADMIN_USERNAME")),
 		AdminPassword:       os.Getenv("RYUBOT_ADMIN_PASSWORD"),
 	}

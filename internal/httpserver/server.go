@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
@@ -77,7 +78,7 @@ func recoverer(logger *slog.Logger, next http.Handler) http.Handler {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				logger.Error("request panic", "error", recovered, "stack", string(debug.Stack()))
-				writeJSON(response, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+				writeJSON(response, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("%v", recovered)})
 			}
 		}()
 		next.ServeHTTP(response, request)

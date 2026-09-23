@@ -27,10 +27,30 @@ type Engine struct {
 	events   *eventSubscribers
 	workerID string
 	commands *CommandQueue
+
+	pendingMu   sync.Mutex
+	pendingFees []SessionFee
+	flushTicker *time.Ticker
 }
 
 func NewEngine(pool *pgxpool.Pool, provider *pasino.Client, logger *slog.Logger, workerID string) *Engine {
-	return &Engine{pool: pool, provider: provider, ledger: NewLedger(pool), logger: logger, running: make(map[int64]context.CancelFunc), events: newEventSubscribers(), workerID: workerID, commands: NewCommandQueue(pool)}
+	e := &Engine{
+		pool: pool, provider: provider, ledger: NewLedger(pool),
+		logger: logger, running: make(map[int64]context.CancelFunc),
+		events: newEventSubscribers(), workerID: workerID,
+		commands: NewCommandQueue(pool),
+	}
+	e.flushTicker = time.NewTicker(2 * time.Second)
+	go e.flushLoop()
+	return e
+}
+
+func (e *Engine) flushLoop() {
+	for range e.flushTicker.C {
+		if err := e.FlushPendingFees(context.Background()); err != nil {
+			e.logger.Error("flush pending fees failed", "error", err)
+		}
+	}
 }
 
 func (e *Engine) Recover(ctx context.Context) error {
@@ -65,6 +85,54 @@ func (e *Engine) Recover(ctx context.Context) error {
 		go e.run(userID, id)
 	}
 	return rows.Err()
+}
+
+// settleBet settles the bet immediately (provider_bets, trading_events,
+// trading_sessions balance) and buffers fee data for batch accrual
+// at session end. This avoids write spikes to fee tables during rolling.
+func (e *Engine) settleBet(ctx context.Context, userID int64, coin string, bet PreparedBet, settlement Settlement) error {
+	if err := e.ledger.SettleImmediate(ctx, bet, settlement); err != nil {
+		return fmt.Errorf("settle immediate: %w", err)
+	}
+	e.pendingMu.Lock()
+	e.pendingFees = append(e.pendingFees, SessionFee{
+		UserID:        userID,
+		Coin:          coin,
+		Bet:           bet,
+		Settlement:    settlement,
+		HoldingAmount: settlement.Allocation.HoldingAmount,
+		KangdenAmount: settlement.Allocation.KangdenAmount,
+		Result:        settlement.Result,
+		GrossProfit:   settlement.GrossProfit,
+		FeeExempt:     settlement.FeeExempt,
+	})
+	e.pendingMu.Unlock()
+	return nil
+}
+
+// FlushPendingFees writes all deferred fee balances and referral
+// bonuses in a single batch. Called periodically and on session end.
+func (e *Engine) FlushPendingFees(ctx context.Context) error {
+	e.pendingMu.Lock()
+	fees := make([]SessionFee, len(e.pendingFees))
+	copy(fees, e.pendingFees)
+	e.pendingFees = e.pendingFees[:0]
+	e.pendingMu.Unlock()
+	if len(fees) == 0 {
+		return nil
+	}
+	e.logger.Info("flushing session fees", "count", len(fees))
+	return e.ledger.AccrueSessionFees(ctx, fees)
+}
+
+// Close stops the flush loop and performs a final fee flush.
+func (e *Engine) Close() {
+	if e.flushTicker != nil {
+		e.flushTicker.Stop()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = e.FlushPendingFees(ctx)
 }
 
 func (e *Engine) Start(ctx context.Context, userID int64, stopOnWin ...bool) (string, error) {
@@ -117,8 +185,6 @@ func (e *Engine) Start(ctx context.Context, userID int64, stopOnWin ...bool) (st
 	if err != nil {
 		return "", err
 	}
-	// Sama dengan base: sesi baru selalu mulai dengan Stop Win OFF. Tombol
-	// Stop Win hanya mengubah sesi yang sedang berjalan.
 	settings.StopOnWin = len(stopOnWin) > 0 && stopOnWin[0]
 	raw, _ = json.Marshal(settings)
 	rules, ruleRaw, err := LoadBusinessRules(ctx, e.pool, coin)
@@ -151,8 +217,6 @@ func (e *Engine) Start(ctx context.Context, userID int64, stopOnWin ...bool) (st
 	_ = username
 	id, err := e.ledger.Start(ctx, SessionStart{UserID: userID, Coin: coin, SettingsSnapshot: raw, RuleSnapshot: ruleRaw, OpeningBalance: opening, BaseBet: settings.BaseBet})
 	if err != nil {
-		// Dua START dapat tiba hampir bersamaan. Constraint database tetap
-		// menjadi pengaman terakhir, tetapi pengguna tidak boleh melihat error SQL.
 		if lookupErr := e.pool.QueryRow(ctx, `SELECT id::text,status FROM trading_sessions
 			WHERE user_id=$1 AND status IN ('RUNNING','STOP_REQUESTED','RECONCILIATION_REQUIRED')
 			ORDER BY started_at DESC LIMIT 1`, userID).Scan(&existingID, &existingStatus); lookupErr == nil {
@@ -340,12 +404,18 @@ func (e *Engine) run(userID int64, sessionID string) {
 				}
 			}
 			e.publishState(context.Background(), userID, sessionID, "COMPLETED", err.Error())
+			if flushErr := e.FlushPendingFees(context.Background()); flushErr != nil {
+				e.logger.Error("final fee flush on error failed", "error", flushErr)
+			}
 			return
 		}
 		if stop {
 			var status, reason string
 			if queryErr := e.pool.QueryRow(context.Background(), `SELECT status,coalesce(stop_reason,'') FROM trading_sessions WHERE id=$1`, sessionID).Scan(&status, &reason); queryErr == nil {
 				e.publishState(context.Background(), userID, sessionID, status, reason)
+			}
+			if flushErr := e.FlushPendingFees(context.Background()); flushErr != nil {
+				e.logger.Error("final fee flush on stop failed", "error", flushErr)
 			}
 			return
 		}
@@ -509,7 +579,7 @@ func (e *Engine) roll(ctx context.Context, userID int64, sessionID string) (bool
 		providerRef = ""
 	}
 	responseRaw, _ := json.Marshal(result)
-	if err = e.ledger.Settle(ctx, bet, Settlement{ProviderReference: providerRef, ProviderBalanceBefore: providerBefore, ProviderBalanceAfter: providerBefore + gross, GrossProfit: gross, Result: outcome, LastResult: next.LastResult, Allocation: allocation, NextBet: next.CurrentBet, Wins: next.Wins, Losses: next.Losses, Streak: next.Streak, ProfitCycle: next.ProfitCycle, Response: responseRaw, ReferralBPS: rules.ReferralBPS, FeeExempt: exempt}); err != nil {
+	if err = e.settleBet(ctx, userID, coin, bet, Settlement{ProviderReference: providerRef, ProviderBalanceBefore: providerBefore, ProviderBalanceAfter: providerBefore + gross, GrossProfit: gross, Result: outcome, LastResult: next.LastResult, Allocation: allocation, NextBet: next.CurrentBet, Wins: next.Wins, Losses: next.Losses, Streak: next.Streak, ProfitCycle: next.ProfitCycle, Response: responseRaw, ReferralBPS: rules.ReferralBPS, FeeExempt: exempt}); err != nil {
 		return true, 0, err
 	}
 	profit += allocation.UserProfit
@@ -538,8 +608,12 @@ func (e *Engine) roll(ctx context.Context, userID int64, sessionID string) (bool
 	if delay < 0 {
 		delay = 0
 	}
-	if delay < 1*time.Second {
-		delay = 1 * time.Second
+	// Honours the configured delay. The API and DB already enforce a 100ms
+	// minimum, so the previous 1s clamp silently ignored every delay below
+	// 1s (e.g. the UI's 300ms setting). A 100ms floor still guards any
+	// legacy session with a sub-minimum value.
+	if delay < 100*time.Millisecond {
+		delay = 100 * time.Millisecond
 	}
 	return false, delay, nil
 }

@@ -776,7 +776,7 @@ CREATE TABLE public.user_trading_settings (
     CONSTRAINT user_trading_settings_boom_win_amount_check CHECK ((boom_win_amount >= (0)::numeric)),
     CONSTRAINT user_trading_settings_chance_max_check CHECK ((((chance_max)::numeric > (0)::numeric) AND ((chance_max)::numeric < (100)::numeric))),
     CONSTRAINT user_trading_settings_chance_min_check CHECK ((((chance_min)::numeric > (0)::numeric) AND ((chance_min)::numeric < (100)::numeric))),
-    CONSTRAINT user_trading_settings_delay_ms_check CHECK (((delay_ms >= 250) AND (delay_ms <= 600000))),
+    CONSTRAINT user_trading_settings_delay_ms_check CHECK (((delay_ms >= 100) AND (delay_ms <= 600000))),
     CONSTRAINT user_trading_settings_martingale_on_loss_check CHECK (((martingale_on_loss)::numeric >= (0)::numeric)),
     CONSTRAINT user_trading_settings_martingale_on_win_check CHECK (((martingale_on_win)::numeric >= (0)::numeric)),
     CONSTRAINT user_trading_settings_maximum_bet_check CHECK ((maximum_bet >= (0)::numeric)),

@@ -34,7 +34,7 @@ func main() {
 
 func run(args []string, logger *slog.Logger) error {
 	if len(args) == 0 {
-		return errors.New("usage: ryubot <serve|worker|init-database|migrate|import-legacy|bootstrap-admin|verify|version>")
+		return errors.New("usage: ryubot <serve|worker|init-database|migrate|import-legacy|bootstrap-admin|verify|wallet-balances|wallet-move|bonus-move|version>")
 	}
 	switch args[0] {
 	case "serve":
@@ -58,6 +58,12 @@ func run(args []string, logger *slog.Logger) error {
 		return bootstrapAdmin(args[1])
 	case "verify":
 		return verifySetup()
+	case "wallet-balances":
+		return walletBalances(args[1:])
+	case "wallet-move":
+		return walletMove(args[1:])
+	case "bonus-move":
+		return bonusMove(args[1:])
 	case "version":
 		fmt.Printf("%s commit=%s built=%s\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuiltAt)
 		return nil
@@ -98,6 +104,7 @@ func serve(logger *slog.Logger) error {
 	workerID, _ := os.Hostname()
 	workerID = fmt.Sprintf("%s-%d", workerID, os.Getpid())
 	tradingEngine := trading.NewEngine(tradingPool, pasinoClient, logger, workerID)
+	defer tradingEngine.Close()
 	userAPI := user.NewHTTP(userStore, pasinoClient, tradingEngine, logger, cfg.Environment == "production")
 	server := httpserver.New(cfg, logger, panel, userAPI)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -148,6 +155,7 @@ func worker(logger *slog.Logger) error {
 	defer client.Close()
 	host, _ := os.Hostname()
 	engine := trading.NewEngine(pool, client, logger, fmt.Sprintf("%s-%d", host, os.Getpid()))
+	defer engine.Close()
 	go management.New(pool, client, logger).Run(ctx)
 	logger.Info("trading worker starting")
 	return engine.RunWorker(ctx)

@@ -46,13 +46,27 @@ func (s *Service) Run(ctx context.Context) {
 	}
 }
 
+// stopExpiredSubscriptions halts running trading sessions for active users
+// whose subscription has run out, so an expired account cannot keep rolling.
+func (s *Service) stopExpiredSubscriptions(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `UPDATE trading_sessions SET status='STOP_REQUESTED',stop_reason='Langganan berakhir',updated_at=now()
+		WHERE status='RUNNING' AND user_id IN (SELECT id FROM users WHERE status='ACTIVE' AND subscription_expires_at IS NOT NULL AND subscription_expires_at<=now())`)
+	return err
+}
+
 func (s *Service) run(ctx context.Context) {
+	if err := s.stopExpiredSubscriptions(ctx); err != nil {
+		s.logger.Error("stop expired subscriptions failed", "error", err)
+	}
 	feeCtx, cancelFees := context.WithTimeout(ctx, 25*time.Second)
 	if err := s.dispatchFees(feeCtx); err != nil && !errors.Is(err, context.Canceled) {
 		s.logger.Error("management fee payout failed", "error", err)
 	}
 	cancelFees()
-	location, _ := time.LoadLocation("Asia/Jakarta")
+	location, err := time.LoadLocation("Asia/Jakarta")
+	if err != nil {
+		location = time.Local
+	}
 	now := time.Now().In(location)
 	currentTime := now.Format("15:04")
 	cfg, err := s.settings(ctx, "owner.cutoff_1", "owner.cutoff_2")
@@ -205,7 +219,10 @@ func (s *Service) runCutoffAt(ctx context.Context, slot string) error {
 	if err != nil {
 		return err
 	}
-	location, _ := time.LoadLocation("Asia/Jakarta")
+	location, err := time.LoadLocation("Asia/Jakarta")
+	if err != nil {
+		location = time.Local
+	}
 	now := time.Now().In(location)
 	var collectorID int64
 	if err = s.pool.QueryRow(ctx, `SELECT id FROM users WHERE lower(username)=lower($1) AND status='ACTIVE'`, cfg["account.fee_collector_username"]).Scan(&collectorID); err != nil {

@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +28,11 @@ import (
 )
 
 var ErrUnauthorized = errors.New("Pasino session is not authorized")
+
+// pasinoUserAgent makes pasino API calls look like an ordinary browser. The
+// Pasino edge (Cloudflare) can challenge the stock Go user agent from
+// datacenter IPs and reply with an HTML block page instead of JSON.
+const pasinoUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 type OutcomeUnknownError struct{ Cause error }
 
@@ -40,12 +47,18 @@ type Client struct {
 	socketURL     string
 	apiKey        string
 	credentialKey string
+	referrer      string
 	http          *http.Client
+	dial          *websocket.DialOptions
 	socketsMu     sync.Mutex
 	sockets       map[int64]*providerSocket
 	connectLocks  map[int64]*sync.Mutex
+	reconnecting  map[int64]bool
+	shutdown      chan struct{}
+	shutdownOnce  sync.Once
 	balanceMu     sync.Mutex
 	balanceCache  map[string]cachedBalance
+	lastKnown     map[string]string
 	balanceFlight map[string]*balanceFlight
 }
 
@@ -80,9 +93,28 @@ func Open(ctx context.Context, databaseURL string, cfg config.Config) (*Client, 
 		pool.Close()
 		return nil, err
 	}
-	return &Client{pool: pool, apiBaseURL: strings.TrimRight(cfg.PasinoAPIBaseURL, "/"), socketURL: cfg.PasinoSocketURL, apiKey: cfg.PasinoAPIKey, credentialKey: cfg.PasinoCredentialKey, http: &http.Client{Timeout: 10 * time.Second}, sockets: make(map[int64]*providerSocket), connectLocks: make(map[int64]*sync.Mutex), balanceCache: make(map[string]cachedBalance), balanceFlight: make(map[string]*balanceFlight)}, nil
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	client := &Client{pool: pool, apiBaseURL: strings.TrimRight(cfg.PasinoAPIBaseURL, "/"), socketURL: cfg.PasinoSocketURL, apiKey: cfg.PasinoAPIKey, credentialKey: cfg.PasinoCredentialKey, referrer: cfg.PasinoReferrer, http: httpClient, sockets: make(map[int64]*providerSocket), connectLocks: make(map[int64]*sync.Mutex), reconnecting: make(map[int64]bool), shutdown: make(chan struct{}), balanceCache: make(map[string]cachedBalance), lastKnown: make(map[string]string), balanceFlight: make(map[string]*balanceFlight)}
+	client.dial = &websocket.DialOptions{HTTPHeader: http.Header{"User-Agent": []string{pasinoUserAgent}}}
+	if cfg.PasinoProxyURL != "" {
+		// Optional clean-IP upstream: Pasino's edge blocks some VPS/datacenter
+		// IPs (HTTP 403 + HTML). Pointing PASINO_PROXY_URL at a SOCKS5/HTTP
+		// proxy with an allowed IP makes the API and WebSocket egress from
+		// that IP (socks5/socks5h and http/https schemes supported).
+		proxyURL, err := url.Parse(cfg.PasinoProxyURL)
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("PASINO_PROXY_URL tidak valid: %w", err)
+		}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.Proxy = http.ProxyURL(proxyURL)
+		httpClient.Transport = transport
+		client.dial.HTTPClient = httpClient
+	}
+	return client, nil
 }
 func (c *Client) Close() {
+	c.shutdownOnce.Do(func() { close(c.shutdown) })
 	c.socketsMu.Lock()
 	for _, socket := range c.sockets {
 		socket.stopOnce.Do(func() { close(socket.stop) })
@@ -99,7 +131,7 @@ func (c *Client) Close() {
 func (c *Client) RegisterAndLogin(ctx context.Context, username, email, password string) (string, error) {
 	_, err := c.post(ctx, "/api/register", map[string]any{
 		"user_name": username, "user_email": email, "password": password,
-		"agreement": 1, "referrer": "277064",
+		"agreement": 1, "referrer": c.referrer, "api_key": c.apiKey,
 	})
 	if err != nil {
 		return "", err
@@ -188,11 +220,34 @@ func (c *Client) Balance(ctx context.Context, userID int64, coin string) (string
 	running.value, running.err = value, err
 	if err == nil {
 		c.balanceCache[key] = cachedBalance{value: value, expiresAt: time.Now().Add(5 * time.Second)}
+		c.lastKnown[key] = value
 	}
 	delete(c.balanceFlight, key)
 	close(running.done)
 	c.balanceMu.Unlock()
 	return value, err
+}
+
+// BalanceForDisplay serves UI reads. It prefers the live provider value and
+// falls back to the last known balance while the socket is being
+// re-established, so switching coins keeps rendering a number. The stale flag
+// marks the fallback; money-moving callers must keep using Balance.
+func (c *Client) BalanceForDisplay(ctx context.Context, userID int64, coin string) (value string, stale bool, err error) {
+	coin = strings.ToUpper(strings.TrimSpace(coin))
+	value, err = c.Balance(ctx, userID, coin)
+	if err == nil {
+		return value, false, nil
+	}
+	if errors.Is(err, ErrUnauthorized) || ctx.Err() != nil {
+		return "", false, err
+	}
+	c.balanceMu.Lock()
+	last, ok := c.lastKnown[fmt.Sprintf("%d:%s", userID, coin)]
+	c.balanceMu.Unlock()
+	if ok {
+		return last, true, nil
+	}
+	return "", false, err
 }
 
 // Balances requests several coins over one authenticated socket round-trip.
@@ -271,25 +326,41 @@ func (c *Client) Balances(ctx context.Context, userID int64, coins []string) (ma
 	now := time.Now()
 	c.balanceMu.Lock()
 	for coin, value := range result {
-		c.balanceCache[fmt.Sprintf("%d:%s", userID, coin)] = cachedBalance{value: value, expiresAt: now.Add(5 * time.Second)}
+		key := fmt.Sprintf("%d:%s", userID, coin)
+		c.balanceCache[key] = cachedBalance{value: value, expiresAt: now.Add(5 * time.Second)}
+		c.lastKnown[key] = value
 	}
 	c.balanceMu.Unlock()
 	return result, nil
 }
 
 // ClearBalanceCache mirrors the legacy provider session: every operation that
-// can alter a provider balance invalidates the short-lived read cache.
+// can alter a provider balance invalidates the short-lived read cache and the
+// last known fallback, so a stale value can never survive a mutation.
 func (c *Client) ClearBalanceCache(userID int64, coin string) {
 	key := fmt.Sprintf("%d:%s", userID, strings.ToUpper(strings.TrimSpace(coin)))
 	c.balanceMu.Lock()
 	delete(c.balanceCache, key)
+	delete(c.lastKnown, key)
 	c.balanceMu.Unlock()
 }
 
 func (c *Client) readBalance(ctx context.Context, userID int64, coin string) (string, error) {
-	// A failed read drops the stale provider socket. The browser receives a
-	// retry response and the next request establishes a fresh socket. Retrying
-	// here would block the realtime response for another full timeout.
+	value, err := c.readBalanceOnce(ctx, userID, coin)
+	if err == nil {
+		return value, nil
+	}
+	// Socket failures and internal timeouts are retried once on a fresh
+	// socket (readBalanceOnce dropped the dead one). A cancelled HTTP request
+	// or an unauthorized account must not pay the extra round-trip.
+	if ctx.Err() != nil || errors.Is(err, ErrUnauthorized) {
+		return "", err
+	}
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-time.After(300 * time.Millisecond):
+	}
 	return c.readBalanceOnce(ctx, userID, coin)
 }
 
@@ -397,6 +468,7 @@ func (c *Client) walletMutation(ctx context.Context, userID int64, path string, 
 		return nil, err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("User-Agent", pasinoUserAgent)
 	response, err := c.http.Do(request)
 	if err != nil {
 		return nil, &OutcomeUnknownError{Cause: fmt.Errorf("Pasino tidak dapat dihubungi: %w", err)}
@@ -404,7 +476,8 @@ func (c *Client) walletMutation(ctx context.Context, userID int64, path string, 
 	defer response.Body.Close()
 	var payload map[string]any
 	if err = json.NewDecoder(response.Body).Decode(&payload); err != nil {
-		return nil, &OutcomeUnknownError{Cause: errors.New("respons Pasino tidak valid")}
+		snippet, _ := io.ReadAll(io.LimitReader(response.Body, 256))
+		return nil, &OutcomeUnknownError{Cause: fmt.Errorf("respons Pasino tidak valid (HTTP %s): %q", response.Status, strings.TrimSpace(string(snippet)))}
 	}
 	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
 		return nil, ErrUnauthorized
@@ -538,7 +611,7 @@ func (c *Client) ensureSocket(ctx context.Context, userID int64) (*providerSocke
 	}
 	connectCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	connection, _, err := websocket.Dial(connectCtx, c.socketURL, nil)
+	connection, _, err := websocket.Dial(connectCtx, c.socketURL, c.dial)
 	if err != nil {
 		return nil, fmt.Errorf("hubungkan socket Pasino: %w", err)
 	}
@@ -601,6 +674,66 @@ func (c *Client) dropSocket(userID int64, target *providerSocket) {
 		close(target.stop)
 		_ = target.connection.Close(websocket.StatusNormalClosure, "reconnect")
 	})
+	c.scheduleReconnect(userID)
+}
+
+// scheduleReconnect re-establishes the dropped socket in the background so the
+// next user request does not pay the full dial+authenticate latency. Only one
+// loop per user runs at a time; concurrent drops rely on the running loop.
+func (c *Client) scheduleReconnect(userID int64) {
+	c.socketsMu.Lock()
+	if c.reconnecting[userID] {
+		c.socketsMu.Unlock()
+		return
+	}
+	c.reconnecting[userID] = true
+	c.socketsMu.Unlock()
+	go func() {
+		defer func() {
+			c.socketsMu.Lock()
+			delete(c.reconnecting, userID)
+			c.socketsMu.Unlock()
+		}()
+		c.reconnectLoop(userID)
+	}()
+}
+
+// reconnectLoop retries the Pasino socket with exponential backoff. It stops
+// once any live socket exists for the user, when credentials are rejected, or
+// after bounded attempts; the next request then falls back to the lazy
+// connect inside ensureSocket.
+func (c *Client) reconnectLoop(userID int64) {
+	delay := time.Second
+	for attempt := 0; attempt < 8; attempt++ {
+		select {
+		case <-c.shutdown:
+			return
+		case <-time.After(delay):
+		}
+		c.socketsMu.Lock()
+		current := c.sockets[userID]
+		c.socketsMu.Unlock()
+		if current != nil {
+			select {
+			case <-current.stop:
+			default:
+				return
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_, err := c.ensureSocket(ctx, userID)
+		cancel()
+		if err == nil {
+			return
+		}
+		if errors.Is(err, ErrUnauthorized) {
+			return
+		}
+		delay *= 2
+		if delay > 30*time.Second {
+			delay = 30 * time.Second
+		}
+	}
 }
 
 // DropUserSocket forces the next operation to authenticate with the latest
@@ -611,6 +744,11 @@ func (c *Client) DropUserSocket(userID int64) {
 	for key := range c.balanceCache {
 		if strings.HasPrefix(key, prefix) {
 			delete(c.balanceCache, key)
+		}
+	}
+	for key := range c.lastKnown {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.lastKnown, key)
 		}
 	}
 	c.balanceMu.Unlock()
@@ -688,6 +826,7 @@ func (c *Client) post(ctx context.Context, path string, body any) (map[string]an
 		return nil, err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("User-Agent", pasinoUserAgent)
 	response, err := c.http.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("Pasino tidak dapat dihubungi: %w", err)
@@ -695,7 +834,8 @@ func (c *Client) post(ctx context.Context, path string, body any) (map[string]an
 	defer response.Body.Close()
 	var payload map[string]any
 	if err = json.NewDecoder(response.Body).Decode(&payload); err != nil {
-		return nil, errors.New("respons Pasino tidak valid")
+		snippet, _ := io.ReadAll(io.LimitReader(response.Body, 256))
+		return nil, fmt.Errorf("respons Pasino tidak valid (HTTP %s): %q", response.Status, strings.TrimSpace(string(snippet)))
 	}
 	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
 		return nil, ErrUnauthorized
@@ -705,7 +845,7 @@ func (c *Client) post(ctx context.Context, path string, body any) (map[string]an
 		if strings.Contains(message, "token") || strings.Contains(message, "session") {
 			return nil, ErrUnauthorized
 		}
-		return nil, fmt.Errorf("Pasino menolak permintaan: %s", messageString(payload, "message"))
+		return nil, fmt.Errorf("%s", messageString(payload, "message"))
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, fmt.Errorf("Pasino HTTP %d", response.StatusCode)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -124,7 +125,20 @@ func (l *Ledger) MarkSent(ctx context.Context, betID string) error {
 }
 
 // Settle is idempotent by state: only a SENT bet can alter ledger balances.
+// Writes provider_bets, trading_fee_balances, trading_sessions, trading_events,
+// and referral bonuses in one transaction.
 func (l *Ledger) Settle(ctx context.Context, bet PreparedBet, input Settlement) error {
+	return l.settle(ctx, bet, input, true)
+}
+
+// SettleImmediate settles the bet immediately but defers fee transfer
+// (trading_fee_balances and referral bonus) until AccrueSessionFees.
+// This avoids write spikes to fee tables during active rolling.
+func (l *Ledger) SettleImmediate(ctx context.Context, bet PreparedBet, input Settlement) error {
+	return l.settle(ctx, bet, input, false)
+}
+
+func (l *Ledger) settle(ctx context.Context, bet PreparedBet, input Settlement, writeFees bool) error {
 	if input.Result != Win && input.Result != Loss {
 		return errors.New("invalid result")
 	}
@@ -156,13 +170,20 @@ func (l *Ledger) Settle(ctx context.Context, bet PreparedBet, input Settlement) 
 	if err != nil {
 		return err
 	}
-	if input.Allocation.HoldingAmount > 0 || input.Allocation.KangdenAmount > 0 {
-		if _, err = tx.Exec(ctx, `INSERT INTO trading_fee_balances(user_id,coin,holding_pending,kangden_pending)
-			VALUES($1,$2,$3,$4) ON CONFLICT(user_id,coin) DO UPDATE SET
-			holding_pending=trading_fee_balances.holding_pending+excluded.holding_pending,
-			kangden_pending=trading_fee_balances.kangden_pending+excluded.kangden_pending,updated_at=now()`,
-			bet.UserID, bet.Coin, input.Allocation.HoldingAmount.String(), input.Allocation.KangdenAmount.String()); err != nil {
-			return err
+	if writeFees {
+		if input.Allocation.HoldingAmount > 0 || input.Allocation.KangdenAmount > 0 {
+			if _, err = tx.Exec(ctx, `INSERT INTO trading_fee_balances(user_id,coin,holding_pending,kangden_pending)
+				VALUES($1,$2,$3,$4) ON CONFLICT(user_id,coin) DO UPDATE SET
+				holding_pending=trading_fee_balances.holding_pending+excluded.holding_pending,
+				kangden_pending=trading_fee_balances.kangden_pending+excluded.kangden_pending,updated_at=now()`,
+				bet.UserID, bet.Coin, input.Allocation.HoldingAmount.String(), input.Allocation.KangdenAmount.String()); err != nil {
+				return err
+			}
+		}
+		if input.Result == Win && input.GrossProfit > 0 && !input.FeeExempt {
+			if err = l.accrueReferral(ctx, tx, bet, input); err != nil {
+				return err
+			}
 		}
 	}
 	var visibleBalance string
@@ -172,9 +193,6 @@ func (l *Ledger) Settle(ctx context.Context, bet PreparedBet, input Settlement) 
 	if err != nil {
 		return err
 	}
-	// Hasil roll, saldo bersih, dan ledger fee berada dalam transaksi yang
-	// sama. UI tidak mungkin menerima roll tanpa saldo tersimpan atau saldo
-	// berubah tanpa baris roll yang dapat dimuat ulang setelah reconnect.
 	_, err = tx.Exec(ctx, `INSERT INTO trading_events(user_id,session_id,event_type,payload)
 		VALUES($1,$2,'ROLL_SETTLED',jsonb_build_object(
 			'bet_id',$3::text,'coin',$4::text,'amount',$5::text,'result',$6::text,
@@ -186,12 +204,66 @@ func (l *Ledger) Settle(ctx context.Context, bet PreparedBet, input Settlement) 
 	if err != nil {
 		return err
 	}
-	if input.Result == Win && input.GrossProfit > 0 && !input.FeeExempt {
-		if err = l.accrueReferral(ctx, tx, bet, input); err != nil {
+	return tx.Commit(ctx)
+}
+
+// AccrueSessionFees writes all deferred fee balances and referral
+// bonuses for a session in a single batch. Called when trading stops
+// to avoid write spikes during active rolling.
+func (l *Ledger) AccrueSessionFees(ctx context.Context, fees []SessionFee) error {
+	if len(fees) == 0 {
+		return nil
+	}
+	tx, err := l.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var totalHolding, totalKangden = new(big.Rat), new(big.Rat)
+	userID := fees[0].UserID
+	coin := fees[0].Coin
+	for _, f := range fees {
+		if h, ok := new(big.Rat).SetString(f.HoldingAmount.String()); ok && h.Sign() > 0 {
+			totalHolding.Add(totalHolding, h)
+		}
+		if k, ok := new(big.Rat).SetString(f.KangdenAmount.String()); ok && k.Sign() > 0 {
+			totalKangden.Add(totalKangden, k)
+		}
+	}
+
+	if totalHolding.Sign() > 0 || totalKangden.Sign() > 0 {
+		_, err = tx.Exec(ctx, `INSERT INTO trading_fee_balances(user_id,coin,holding_pending,kangden_pending)
+			VALUES($1,$2,$3,$4) ON CONFLICT(user_id,coin) DO UPDATE SET
+			holding_pending=trading_fee_balances.holding_pending+EXCLUDED.holding_pending,
+			kangden_pending=trading_fee_balances.kangden_pending+EXCLUDED.kangden_pending,updated_at=now()`,
+			userID, coin, totalHolding.FloatString(8), totalKangden.FloatString(8))
+		if err != nil {
 			return err
 		}
 	}
+
+	for _, f := range fees {
+		if f.Result == Win && f.GrossProfit > 0 && !f.FeeExempt {
+			if err := l.accrueReferral(ctx, tx, f.Bet, f.Settlement); err != nil {
+				return err
+			}
+		}
+	}
 	return tx.Commit(ctx)
+}
+
+// SessionFee holds fee data for one bet to be accrued later.
+type SessionFee struct {
+	UserID        int64
+	Coin          string
+	Bet           PreparedBet
+	Settlement    Settlement
+	HoldingAmount Money
+	KangdenAmount Money
+	Result        Result
+	GrossProfit   Money
+	FeeExempt     bool
 }
 
 func (l *Ledger) accrueReferral(ctx context.Context, tx pgx.Tx, bet PreparedBet, input Settlement) error {
@@ -201,7 +273,7 @@ func (l *Ledger) accrueReferral(ctx context.Context, tx pgx.Tx, bet PreparedBet,
 			continue
 		}
 		var next *int64
-		if err := tx.QueryRow(ctx, `SELECT referrer_user_id FROM user_referrals WHERE user_id=$1`, current).Scan(&next); err != nil {
+		if err := queryRow(ctx, tx, l.pool, `SELECT referrer_user_id FROM user_referrals WHERE user_id=$1`, current).Scan(&next); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				break
 			}
@@ -220,14 +292,13 @@ func (l *Ledger) accrueReferral(ctx context.Context, tx pgx.Tx, bet PreparedBet,
 				return err
 			}
 			source := fmt.Sprintf("provider-bet:%s:referral:%d", bet.ID, level+1)
-			tag, err := tx.Exec(ctx, `INSERT INTO referral_bonus_events(id,user_id,coin,amount,event_type,source_external_id) VALUES($1,$2,$3,$4,'TRADING_ACCRUAL',$5) ON CONFLICT(event_type,source_external_id) DO NOTHING`, eventID, *next, bet.Coin, amount.String(), source)
+			_, err = execTx(ctx, tx, l.pool, `INSERT INTO referral_bonus_events(id,user_id,coin,amount,event_type,source_external_id) VALUES($1,$2,$3,$4,'TRADING_ACCRUAL',$5) ON CONFLICT(event_type,source_external_id) DO NOTHING`, eventID, *next, bet.Coin, amount.String(), source)
 			if err != nil {
 				return err
 			}
-			if tag.RowsAffected() == 1 {
-				if _, err = tx.Exec(ctx, `INSERT INTO referral_bonus_balances(user_id,coin,available_amount) VALUES($1,$2,$3) ON CONFLICT(user_id,coin) DO UPDATE SET available_amount=referral_bonus_balances.available_amount+excluded.available_amount,updated_at=now()`, *next, bet.Coin, amount.String()); err != nil {
-					return err
-				}
+			_, err = execTx(ctx, tx, l.pool, `INSERT INTO referral_bonus_balances(user_id,coin,available_amount) VALUES($1,$2,$3) ON CONFLICT(user_id,coin) DO UPDATE SET available_amount=referral_bonus_balances.available_amount+EXCLUDED.available_amount,updated_at=now()`, *next, bet.Coin, amount.String())
+			if err != nil {
+				return err
 			}
 		}
 		current = *next
@@ -235,8 +306,23 @@ func (l *Ledger) accrueReferral(ctx context.Context, tx pgx.Tx, bet PreparedBet,
 	return nil
 }
 
-// Reconciliation is terminal for automatic execution. An administrator must
-// inspect the provider outcome before this session can be resolved.
+func queryRow(ctx context.Context, tx pgx.Tx, pool *pgxpool.Pool, sql string, args ...any) pgx.Row {
+	if tx != nil {
+		return tx.QueryRow(ctx, sql, args...)
+	}
+	return pool.QueryRow(ctx, sql, args...)
+}
+
+func execTx(ctx context.Context, tx pgx.Tx, pool *pgxpool.Pool, sql string, args ...any) (int64, error) {
+	if tx != nil {
+		tag, err := tx.Exec(ctx, sql, args...)
+		return tag.RowsAffected(), err
+	}
+	tag, err := pool.Exec(ctx, sql, args...)
+	return tag.RowsAffected(), err
+}
+
+// RequireReconciliation marks a bet/session for manual reconciliation.
 func (l *Ledger) RequireReconciliation(ctx context.Context, bet PreparedBet, reason string) error {
 	tx, err := l.pool.Begin(ctx)
 	if err != nil {
@@ -254,8 +340,7 @@ func (l *Ledger) RequireReconciliation(ctx context.Context, bet PreparedBet, rea
 	return tx.Commit(ctx)
 }
 
-// FailConfirmed is used only when Pasino returns an explicit rejection before
-// any outcome exists. It must never be used for a timeout/disconnect.
+// FailConfirmed marks a bet as failed due to explicit provider rejection.
 func (l *Ledger) FailConfirmed(ctx context.Context, bet PreparedBet, reason string) error {
 	tx, err := l.pool.Begin(ctx)
 	if err != nil {
@@ -274,6 +359,13 @@ func (l *Ledger) FailConfirmed(ctx context.Context, bet PreparedBet, reason stri
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// UpdateSessionBalance updates only the visible_user_balance and profit
+// for a running session. Used for immediate UI balance display.
+func (l *Ledger) UpdateSessionBalance(ctx context.Context, sessionID string, profit Money) error {
+	_, err := l.pool.Exec(ctx, `UPDATE trading_sessions SET visible_user_balance=greatest(visible_user_balance+$1::numeric,0), profit=profit+$1::numeric, updated_at=now() WHERE id=$2`, profit.String(), sessionID)
+	return err
 }
 
 func (l *Ledger) Complete(ctx context.Context, sessionID, reason string) error {
